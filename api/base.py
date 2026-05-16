@@ -36,6 +36,7 @@ def get_timestamp():
 
 class SessionManager:
     _instance = None
+    _init_lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -43,15 +44,22 @@ class SessionManager:
         return cls._instance
 
     def __init__(self):
-        self._session = requests.Session()
-        self._session.mount("https://", HTTPAdapter(max_retries=10))
-        self._session.mount("http://", HTTPAdapter(max_retries=10))
-        self._session.request = functools.partial(self._session.request, timeout=5)
-        # For debug purposes
-        # self._session.verify=False
-        self._session.headers.clear()
-        self._session.headers.update(gc.HEADERS)
-        self._session.cookies.update(use_cookies())
+        if getattr(self, "_initialized", False):
+            return
+
+        with self._init_lock:
+            if getattr(self, "_initialized", False):
+                return
+            self._session = requests.Session()
+            self._session.mount("https://", HTTPAdapter(max_retries=10))
+            self._session.mount("http://", HTTPAdapter(max_retries=10))
+            self._session.request = functools.partial(self._session.request, timeout=5)
+            # For debug purposes
+            # self._session.verify=False
+            self._session.headers.clear()
+            self._session.headers.update(gc.HEADERS)
+            self._session.cookies.update(use_cookies())
+            self._initialized = True
 
     @classmethod
     def get_instance(cls) -> Self:

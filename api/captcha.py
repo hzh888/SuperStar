@@ -14,18 +14,25 @@ __author__ = "skreon 1340554713@qq.com"
 __version__ = "1.0.0"
 
 from random import randint
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from ddddocr import DdddOcr
 from requests import session
 
+if TYPE_CHECKING:
+    from ddddocr import DdddOcr
 
-def ocr_init() -> DdddOcr:
+
+def ocr_init() -> "DdddOcr":
     """
     初始化OCR对象
 
     Returns: DdddOcr对象
     """
+    try:
+        from ddddocr import DdddOcr
+    except ImportError as exc:
+        raise RuntimeError("验证码识别功能需要安装 ddddocr: pip install ddddocr") from exc
+
     return DdddOcr(show_ad=False)
 
 
@@ -50,7 +57,7 @@ class CxCaptcha:
         'submit': '/html/processVerify.ac'
     }
 
-    def __init__(self, user_agent: str, cookies: str, ocr: Optional[DdddOcr] = None):
+    def __init__(self, user_agent: str, cookies: str, ocr: Optional["DdddOcr"] = None):
         """
         初始化 CxCaptcha 实例。
 
