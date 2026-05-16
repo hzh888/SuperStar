@@ -7,8 +7,8 @@ import threading
 import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
-from dataclasses import dataclass
-from queue import PriorityQueue, ShutDown
+from dataclasses import dataclass, field
+from queue import PriorityQueue
 from threading import RLock
 from typing import Any
 
@@ -17,7 +17,7 @@ from tqdm import tqdm
 from api.answer import Tiku
 from api.base import Chaoxing, Account, StudyResult
 from api.exceptions import LoginError, InputFormatError
-from api.logger import logger
+from api.logger import configure_console_logger, logger
 from api.notification import Notification
 from api.live import Live
 from api.live_process import LiveProcessor
@@ -123,6 +123,8 @@ def load_config_from_file(config_path):
             common_config["username"] = common_config["username"].strip()
         if "password" in common_config and common_config["password"] is not None:
             common_config["password"] = common_config["password"].strip()
+        if "verbose" in common_config:
+            common_config["verbose"] = str_to_bool(common_config["verbose"])
 
     # 检查并读取tiku节
     if config.has_section("tiku"):
@@ -148,7 +150,8 @@ def build_config_from_args(args):
         "course_list": [item.strip() for item in args.list.split(",") if item.strip()] if args.list else None,
         "speed": args.speed if args.speed else 1.0,
         "jobs": args.jobs,
-        "notopen_action": args.notopen_action if args.notopen_action else "retry"
+        "notopen_action": args.notopen_action if args.notopen_action else "retry",
+        "verbose": args.verbose,
     }
     return common_config, {}, {}
 
@@ -158,7 +161,10 @@ def init_config():
     args = parse_args()
 
     if args.config:
-        return load_config_from_file(args.config)
+        common_config, tiku_config, notification_config = load_config_from_file(args.config)
+        if args.verbose:
+            common_config["verbose"] = True
+        return common_config, tiku_config, notification_config
     else:
         return build_config_from_args(args)
 
@@ -276,11 +282,13 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
 @dataclass(order=True)
 class ChapterTask:
     index: int
-    point: dict[str, Any]
-    result: ChapterResult = ChapterResult.PENDING
-    tries: int = 0
+    point: dict[str, Any] = field(compare=False)
+    result: ChapterResult = field(default=ChapterResult.PENDING, compare=False)
+    tries: int = field(default=0, compare=False)
 
 class JobProcessor:
+    STOP_POINT = {"__stop__": True}
+
     def __init__(self, chaoxing: Chaoxing, course: dict[str, Any], tasks: list[ChapterTask], config: dict[str, Any]):
         if "jobs" not in config or not config["jobs"]:
             config["jobs"] = 4
@@ -295,8 +303,16 @@ class JobProcessor:
         self.retry_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.wait_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.threads: list[threading.Thread] = []
+        self.retry_worker: threading.Thread | None = None
         self.worker_num = config["jobs"]
         self.config = config
+
+    def _stop_task(self) -> ChapterTask:
+        return ChapterTask(index=sys.maxsize, point=self.STOP_POINT)
+
+    @staticmethod
+    def _is_stop_task(task: ChapterTask) -> bool:
+        return task.point.get("__stop__") is True
 
     def run(self):
         for task in self.tasks:
@@ -307,21 +323,29 @@ class JobProcessor:
             self.threads.append(thread)
             thread.start()
 
-        threading.Thread(target=self.retry_thread, daemon=True).start()
+        self.retry_worker = threading.Thread(target=self.retry_thread, daemon=True)
+        self.retry_worker.start()
 
         self.task_queue.join()
-        time.sleep(0.5)
-        self.task_queue.shutdown()
+
+        self.retry_queue.put(self._stop_task())
+        for _ in self.threads:
+            self.task_queue.put(self._stop_task())
+
+        for thread in self.threads:
+            thread.join()
+        if self.retry_worker:
+            self.retry_worker.join()
 
 
     @log_error
     def worker_thread(self):
         tqdm.set_lock(tqdm.get_lock())
         while True:
-            try:
-                task = self.task_queue.get()
-            except ShutDown:
-                logger.info("Queue shut down")
+            task = self.task_queue.get()
+            if self._is_stop_task(task):
+                self.task_queue.task_done()
+                logger.debug("Queue worker stopped")
                 return
 
             task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
@@ -333,12 +357,12 @@ class JobProcessor:
                     logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
 
                 case ChapterResult.NOT_OPEN:
-                    # task.tries += 1
                     if self.config["notopen_action"] == "continue":
                         logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
                         self.task_queue.task_done()
                         continue
 
+                    task.tries += 1
                     if task.tries >= self.max_tries:
                         logger.error(
                             "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
@@ -368,16 +392,17 @@ class JobProcessor:
 
     @log_error
     def retry_thread(self):
-        try:
-            while True:
-                task = self.retry_queue.get()
-                self.task_queue.put(task)
-                # task_done is not called when a task failed and needs to be retried so if is reinserted into the queue,
-                # the task num will increase by one and become more than the real task number
-                self.task_queue.task_done()
-                time.sleep(1) # TODO: Replace with a configurable wait time
-        except ShutDown:
-            pass
+        while True:
+            task = self.retry_queue.get()
+            if self._is_stop_task(task):
+                self.retry_queue.task_done()
+                return
+            self.task_queue.put(task)
+            # task_done is not called when a task failed and needs to be retried so if is reinserted into the queue,
+            # the task num will increase by one and become more than the real task number
+            self.task_queue.task_done()
+            self.retry_queue.task_done()
+            time.sleep(1) # TODO: Replace with a configurable wait time
 
 
 def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, Any], speed:float) -> ChapterResult:
@@ -456,6 +481,10 @@ def filter_courses(all_course, course_list):
             ).split(",")
         except Exception as e:
             raise InputFormatError("输入格式错误") from e
+    course_list = [str(course_id).strip() for course_id in course_list if str(course_id).strip()]
+    if not course_list:
+        logger.warning("未指定课程ID，将学习全部课程")
+        return all_course
 
     # 筛选需要学习的课程
     course_task = []
@@ -465,9 +494,8 @@ def filter_courses(all_course, course_list):
             course_task.append(course)
             course_ids.append(course["courseId"])
     
-    # 如果没有指定课程，则学习所有课程
     if not course_task:
-        course_task = all_course
+        raise InputFormatError(f"未找到指定课程ID: {', '.join(course_list)}")
     
     return course_task
 
@@ -489,6 +517,7 @@ def main():
     try:
         # 初始化配置
         common_config, tiku_config, notification_config = init_config()
+        configure_console_logger("DEBUG" if common_config.get("verbose", False) else "INFO")
         
         # 强制播放按照配置文件调节
         common_config["speed"] = min(2.0, max(1.0, common_config.get("speed", 1.0)))

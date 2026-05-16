@@ -9,5 +9,11 @@ def tqdm_sink(msg):
     tqdm_stream.flush()
 
 logger.remove()
-logger.add(tqdm_sink, colorize=True, enqueue=True)
+_console_handler_id = logger.add(tqdm_sink, colorize=True, enqueue=True, level="INFO")
 logger.add("chaoxing.log", rotation="10 MB", level="TRACE")
+
+
+def configure_console_logger(level: str = "INFO"):
+    global _console_handler_id
+    logger.remove(_console_handler_id)
+    _console_handler_id = logger.add(tqdm_sink, colorize=True, enqueue=True, level=level)
